@@ -1,0 +1,106 @@
+name: Build and Sign
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      source_branch:
+        description: 'The source branch or ref to build from'
+        default: 'lstein/chore/migrate-code-signing'
+        required: true
+
+      release_name:
+        description: 'The name for the release'
+        required: true
+
+
+env:
+  SOURCE_REPOSITORY: 'Invoke-AI/launcher'
+  SOURCE_REPOSITORY_NAME: 'launcher'
+  NODE_VERSION: '22'
+
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    permissions:
+      contents: write
+
+    environment: OSSign
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ github.event.inputs.source_branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Generate lockfile hash without version
+        id: lockfile-hash
+        shell: bash
+        run: echo "hash=$(node .github/scripts/generate-lockfile-hash.js)" >> $GITHUB_OUTPUT
+
+      - name: Cache node modules
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.electron
+            ~/.electron-gyp
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-modules-${{ steps.lockfile-hash.outputs.hash }}
+
+      - name: Install dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Get UV hash
+        id: uv-hash
+        shell: bash
+        run: |
+          echo "hash=$(node -e "console.log(require('./package.json').uv.win.sha256)")" >> $GITHUB_OUTPUT
+
+      - name: Cache UV binaries
+        id: cache-uv
+        uses: actions/cache@v4
+        with:
+          path: assets/bin
+          key: ${{ runner.os }}-uv-${{ steps.uv-hash.outputs.hash }}
+
+      - name: Download uv
+        if: steps.cache-uv.outputs.cache-hit != 'true'
+        run: npm run download win
+
+      - name: Build and sign application
+        run: npm run package
+        env:
+          ENABLE_SIGNING: true
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OSSIGN_CONFIG: ${{ secrets.OSSIGN_CONFIG }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/*.EXE
+            dist/*.blockmap
+            dist/*.yml
+            dist/*.yaml
+          name: ${{ github.event.inputs.release_name }}
+          tag_name: ${{ github.run_id }}
+          body: |
+            <img src="https://github.com/ossign.png" alt="OSSign Logo" width="100" height="100" />
+            # Signed Release ${{ github.event.inputs.release_name }}
+            
+            These are the distributable files for the signed release of ${{ env.SOURCE_REPOSITORY_NAME }} ${{ github.event.inputs.release_name }}
+
+            The source code was fetched from https://github.com/${{ env.SOURCE_REPOSITORY }}@${{ github.event.inputs.source_branch }}
+
