@@ -6,7 +6,7 @@ on:
 
       source_branch:
         description: 'The source branch or ref to build from'
-        default: 'lstein/chore/migrate-code-signing'
+        default: 'main'
         required: true
 
       release_name:
