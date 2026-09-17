@@ -21,6 +21,9 @@ env:
 
 
 jobs:
+  # x64 and arm64 build and sign independently (each needs the OSSign environment's reviewer approval, which
+  # GitHub grants per job, so both prompts appear at once). Neither publishes: the `release` job below
+  # publishes both sets in one step, so a release only ever appears when every build succeeded.
   build:
     runs-on: windows-2022
     
@@ -84,6 +87,147 @@ jobs:
           ENABLE_SIGNING: true
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OSSIGN_CONFIG: ${{ secrets.OSSIGN_CONFIG }}
+
+      - name: Upload signed x64 files
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-win-x64
+          path: |
+            dist/*.exe
+            dist/*.EXE
+            dist/*.blockmap
+            dist/*.yml
+            dist/*.yaml
+          if-no-files-found: error
+          retention-days: 7
+
+  # Windows ARM64 (NVIDIA RTX Spark), built natively so node-pty is rebuilt for arm64 and the bundled uv is the
+  # aarch64 binary. LAUNCHER_WIN_ARCH=arm64 makes the launcher's electron-builder config name the installer
+  # "... Setup <version>-arm64.exe" and put the build on the `latest-arm64` update channel (latest-arm64.yml), so
+  # its files never collide with the x64 installer or its latest.yml in the shared release. A launcher ref that
+  # predates ARM64 support skips this job's work, so older tags can still be re-signed.
+  build-arm64:
+    runs-on: windows-11-arm
+    
+    permissions:
+      contents: write
+
+    environment: OSSign
+    # The unsigned arm64 build takes ~18 minutes on this runner (native node-pty rebuild, cold caches).
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ github.event.inputs.source_branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Generate lockfile hash without version
+        id: lockfile-hash
+        shell: bash
+        run: echo "hash=$(node .github/scripts/generate-lockfile-hash.js)" >> $GITHUB_OUTPUT
+
+      - name: Cache node modules
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.electron
+            ~/.electron-gyp
+          key: ${{ runner.os }}-arm64-node-${{ env.NODE_VERSION }}-modules-${{ steps.lockfile-hash.outputs.hash }}
+
+      - name: Install dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Check that this launcher ref supports Windows ARM64
+        id: support
+        shell: bash
+        # Both must be present: the aarch64 uv (package.json `uv["win-arm64"]`) and the build config's
+        # LAUNCHER_WIN_ARCH handling. A ref with the first but not the second would emit arm64 binaries under the
+        # x64 names and manifest, which the launcher's wait loop would then attach for x64 users.
+        run: |
+          if node -e "process.exit(require('./package.json').uv['win-arm64'] ? 0 : 1)" && grep -q "LAUNCHER_WIN_ARCH" electron-builder.config.ts; then
+            echo "supported=true" >> $GITHUB_OUTPUT
+          else
+            echo "supported=false" >> $GITHUB_OUTPUT
+            echo "This launcher ref has no Windows ARM64 build; skipping."
+          fi
+
+      - name: Get UV hash
+        if: steps.support.outputs.supported == 'true'
+        id: uv-hash
+        shell: bash
+        run: |
+          echo "hash=$(node -e "console.log(require('./package.json').uv['win-arm64'].sha256)")" >> $GITHUB_OUTPUT
+
+      - name: Cache UV binaries
+        if: steps.support.outputs.supported == 'true'
+        id: cache-uv
+        uses: actions/cache@v4
+        with:
+          path: assets/bin
+          key: ${{ runner.os }}-arm64-uv-${{ steps.uv-hash.outputs.hash }}
+
+      - name: Download uv
+        if: steps.support.outputs.supported == 'true' && steps.cache-uv.outputs.cache-hit != 'true'
+        run: npm run download win-arm64
+
+      - name: Build and sign application
+        if: steps.support.outputs.supported == 'true'
+        run: npm run package -- --arm64
+        env:
+          LAUNCHER_WIN_ARCH: arm64
+          ENABLE_SIGNING: true
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OSSIGN_CONFIG: ${{ secrets.OSSIGN_CONFIG }}
+
+      - name: Verify the build is on the arm64 update channel
+        if: steps.support.outputs.supported == 'true'
+        shell: bash
+        # The whole point of LAUNCHER_WIN_ARCH: an arm64 build that wrote latest.yml would be attached for x64 users.
+        run: |
+          test -f dist/latest-arm64.yml || { echo "::error::dist/latest-arm64.yml missing: the arm64 build did not use its own update channel"; exit 1; }
+          test ! -f dist/latest.yml || { echo "::error::dist/latest.yml present: the arm64 build wrote the x64 manifest"; exit 1; }
+          ls dist/*-arm64.exe >/dev/null
+
+      - name: Upload signed arm64 files
+        if: steps.support.outputs.supported == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-win-arm64
+          path: |
+            dist/*.exe
+            dist/*.EXE
+            dist/*.blockmap
+            dist/*.yml
+            dist/*.yaml
+          if-no-files-found: error
+          retention-days: 7
+
+  # One release for both architectures, published only when every build succeeded.
+  release:
+    needs: [build, build-arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download signed files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signed-win-*
+          path: dist
+          merge-multiple: true
 
       - name: Release
         uses: softprops/action-gh-release@v2
