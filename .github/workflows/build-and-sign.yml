@@ -113,8 +113,12 @@ jobs:
       contents: write
 
     environment: OSSign
-    # The unsigned arm64 build takes ~18 minutes on this runner (native node-pty rebuild, cold caches).
+    # The unsigned arm64 build takes ~18 minutes on this runner (native node-pty rebuild, cold caches), plus a few
+    # for the Build Tools install below.
     timeout-minutes: 45
+    env:
+      # Use the VS 2022 Build Tools installed below; node-gyp ignores the image's VS 2026 (see that step).
+      npm_config_msvs_version: '2022'
 
     steps:
       - uses: actions/checkout@v4
@@ -122,31 +126,15 @@ jobs:
           repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ github.event.inputs.source_branch }}
 
+      # No npm cache here: an unsupported ref would save a near-empty one under the same lockfile key, and supported
+      # refs would then restore it. node_modules is cached below, after a real `npm ci`.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
 
-      - name: Generate lockfile hash without version
-        id: lockfile-hash
-        shell: bash
-        run: echo "hash=$(node .github/scripts/generate-lockfile-hash.js)" >> $GITHUB_OUTPUT
-
-      - name: Cache node modules
-        id: cache-node-modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            node_modules
-            ~/.electron
-            ~/.electron-gyp
-          key: ${{ runner.os }}-arm64-node-${{ env.NODE_VERSION }}-modules-${{ steps.lockfile-hash.outputs.hash }}
-
-      - name: Install dependencies
-        if: steps.cache-node-modules.outputs.cache-hit != 'true'
-        run: npm ci
-
+      # Before anything else that can fail, so a ref without ARM64 support skips the rest: its `npm ci` would need
+      # the toolchain below, and a failure in this job blocks the `release` job, x64 included.
       - name: Check that this launcher ref supports Windows ARM64
         id: support
         shell: bash
@@ -160,6 +148,49 @@ jobs:
             echo "supported=false" >> $GITHUB_OUTPUT
             echo "This launcher ref has no Windows ARM64 build; skipping."
           fi
+
+      # The windows-11-arm image ships only Visual Studio 2026 (version 18), which @electron/node-gyp 10.x rejects
+      # ("unsupported version: 18"), so the node-pty rebuild - in `npm ci` and again when electron-builder packages -
+      # fails with "could not find a version of Visual Studio 2017 or newer". The x64 job sidesteps this by pinning
+      # windows-2022; there is no ARM64 image with VS 2022, so install its C++ build tools here, on every run.
+      # Same step as the launcher's own build-windows-arm64 job.
+      - name: Install Visual Studio 2022 Build Tools
+        if: steps.support.outputs.supported == 'true'
+        run: |
+          Invoke-WebRequest -Uri https://aka.ms/vs/17/release/vs_buildtools.exe -OutFile "$env:RUNNER_TEMP\vs_buildtools.exe"
+          $proc = Start-Process -FilePath "$env:RUNNER_TEMP\vs_buildtools.exe" -Wait -PassThru -ArgumentList @(
+            '--quiet', '--wait', '--norestart', '--nocache',
+            '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+            # node-pty's binding.gyp sets SpectreMitigation for every Windows target (MSB8040 without these).
+            '--add', 'Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre',
+            # @electron/node-gyp 10 only accepts an installation that has this component (getToolset), even on ARM64.
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+            '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100'
+          )
+          # 3010 = success, reboot required (not needed for the build tools to be usable).
+          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "vs_buildtools.exe exited with $($proc.ExitCode)" }
+
+      - name: Generate lockfile hash without version
+        if: steps.support.outputs.supported == 'true'
+        id: lockfile-hash
+        shell: bash
+        run: echo "hash=$(node .github/scripts/generate-lockfile-hash.js)" >> $GITHUB_OUTPUT
+
+      - name: Cache node modules
+        if: steps.support.outputs.supported == 'true'
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.electron
+            ~/.electron-gyp
+          key: ${{ runner.os }}-arm64-node-${{ env.NODE_VERSION }}-modules-${{ steps.lockfile-hash.outputs.hash }}
+
+      - name: Install dependencies
+        if: steps.support.outputs.supported == 'true' && steps.cache-node-modules.outputs.cache-hit != 'true'
+        run: npm ci
 
       - name: Get UV hash
         if: steps.support.outputs.supported == 'true'
